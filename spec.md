@@ -43,7 +43,7 @@ sequenceDiagram
     BE->>AIP: POST /agent-runs/{run_id}/steps/{step_id}/feedback<br/>{rating: 1.0 or 0.0}
     alt Feedback persisted successfully
      AIP-->>BE: 200 OK
-     Note over BE: L1 edit (session_id, message_id, feedback_id present)<br/>data = {feedbackType: "THUMBS_UP" or "THUMBS_DOWN"}
+     Note over BE: L1 edit (session_id, message_id)<br/>data = {feedback_id : "string" ,feedbackType: "THUMBS_UP" or "THUMBS_DOWN"}
     
     else Error
         Note over BE:No L1 edit 
@@ -62,8 +62,8 @@ sequenceDiagram
     BE->>BE: Resolve run_id, step_id                                                         
     BE->>AIP: DELETE /agent-runs/{run_id}/steps/{step_id}/feedback/{feedback_id}                               
     alt Feedback deleted successfully                                                                          
-        AIP-->>BE: 200 OK                                                                                                                                                                            
-        Note over BE,UI: SSE L1 edit<br/>type="feedback"<br/>data={"feedbackType":"null"}                          
+        AIP-->>BE: 204 Feedback deleted successfully                                                                                                                                                                           
+        Note over BE: SSE L1 edit<br/>type="feedback"<br/>data={"feedbackType":"null"}                          
     else Deletion failed                                                                                       
                                                                                      
         Note over BE: No L1 edit emitted  
@@ -73,8 +73,6 @@ end
 ### Change Feedback
 
 ```mermaid
-<!-- Mermaid code for Change Feedback flow -->
-```
 sequenceDiagram
     participant UI as composer-chat (UI)
     participant BE as dev-copilot (Backend)
@@ -85,14 +83,14 @@ sequenceDiagram
     BE->>BE: Map feedbackType to rating (THUMBS_UP=1.0, THUMBS_DOWN=0.0)
     BE->>AIP: PUT /agent-runs/{run_id}/steps/{step_id}/feedback/{feedback_id}<br/>{rating,category, comment}
     alt Feedback updated successfully
-        AIP-->>BE: 200 OK 
-        BE-->>UI: 200 OK {feedback_id}
-        Note over BE,UI: SSE L1 edit type=feedback<br/>data={feedback_id, feedbackType=updated}
+        AIP-->>BE: 200 OK
+        BE-->>UI 200 OK {"id":"string"}
+        Note over BE: SSE L1 edit type=feedback<br/>data={feedback_id, feedbackType=updated}
     else Update failed
         AIP-->>BE: Error
-        BE-->>UI: Error response
-        Note over BE,UI: No L1 edit emitted
+        Note over BE: No L1 edit emitted
     end
+```
 ---
 
 ## L1 Edit for Feedback State
@@ -119,14 +117,14 @@ This means all connected SSE clients for that session (including multiple tabs) 
 
 ```
 event: edit
-data: {"session_id":"abc-123","message_id":"msg_def456_2","step_id":2,"type":"feedback","timestamp":"...","data":{"feedback_id":"string","feedbackType":"THUMBS_UP"}}
+data: {"session_id":"abc-123","message_id":"msg_b118b659-0....","type":"feedback","timestamp":"...","data":{"feedback_id":"string","feedbackType":"THUMBS_UP"}}
 ```
 
 ### On delete feedback:
 
 ```
 event: edit
-data: {"session_id": "b118b659-087b-4c7e-9723-74a030a9fa5d", "message_id": "msg_b118b659-087b-4c7e-9723-74a030a9fa5d_630881a3-ceb1-42f4-9e8a-4f63f7ccf6e1", "type": "feedback", "timestamp": "2026-06-16T14:23:23.000656+00:00", "data": {"feedback_id": "string", "feedbackType" : "THUMBS_UP"}}
+data: {"session_id": "b118b659-087b-4c7e-9723-74a030a9fa5d", "message_id": "msg_b118b659-087b-4c7e-9723-74a030a9fa5d_630881a3-ceb1-42f4-9e8a-4f63f7ccf6e1", "type": "feedback", "timestamp": "2026-06-16T14:23:23.000656+00:00", "data": {"feedbackType" : "null"}}
 
 ```
 
@@ -160,8 +158,7 @@ sequenceDiagram
       
       BE->>BE: Add type=feedback to payload
       BE->>BE: Transform: rating==1.0 → THUMBS_UP, rating==0.0 → THUMBS_DOWN
-      BE->>UI: SSE stream step_key,<br/>type=feedback<br/>data={feedback_id,<br/>feedbackType=THUMBS_UP/THUMBS_DOWN}
-end 
+      Note over BE: SSE stream step_key,<br/>type=feedback<br/>data={feedback_id,<br/>feedbackType=THUMBS_UP/THUMBS_DOWN}
 ```
 
 **Stream logic:**
