@@ -176,12 +176,9 @@ sequenceDiagram
 
 ## Detailed Design
 
-## Detailed Design
-
 **Server-side storage:**
-
-During SSE streaming, for each AIP message event the router collects the mapping:
-
+Store a message_map: {message_id: {run_id, step_id}} in the existing orchestrator_state dict. The UI never sees agentic 
+internals, feedback resolution is a simple dict lookup.
 ```python
 # Accumulated during streaming
 message_map[message_id] = {"run_id": run_id, "step_id": step_id}
