@@ -176,40 +176,68 @@ sequenceDiagram
 
 ## Detailed Design
 
-### 1. SSE Envelope Change — Expose run_id and step_id
+## Detailed Design
 
-Currently, the SSE frames sent to the UI contain `session_id` and `message_id` but NOT the AIP `run_id` or `step_id`. The UI needs these to submit feedback.
+**Server-side storage:**
 
-**Current envelope:**
+During SSE streaming, for each AIP message event the router collects the mapping:
 
-```json
-{
-  "session_id": "abc-123",
-  "message_id": "msg_uuid",
-  "type": "text_content",
-  "timestamp": "2026-06-02T10:00:00Z",
-  "data": {"role": "assistant", "content": "Here's your interface..."}
-}
+```python
+# Accumulated during streaming
+message_map[message_id] = {"run_id": run_id, "step_id": step_id}
 ```
 
-**Proposed envelope:**
+After each turn completes, the map is flushed to:
 
-```json
-{
-  "session_id": "abc-123",
-  "message_id": "msg_uuid",
-  "run_id": "def-456-full-uuid",
-  "step_id": "2.done",
-  "type": "text_content",
-  "timestamp": "2026-06-02T10:00:00Z",
-  "data": {"role": "assistant", "content": "Here's your interface..."}
-}
+```python
+session.orchestrator_state["message_map"] = message_map
 ```
 
-**Rules:**
-- `run_id` and `step_id` are only included on events originating from AIP messages (not synthetic events like `stream_end`)
-- `step_id` format follows AIP convention: `{index}.{type}` (e.g., `0.user-request`, `1.tool-use`, `2.done`)
-- `run_id` is the full UUID of the AIP run (planning or execution) that produced the message
+This allows the feedback endpoints to resolve `run_id` and `step_id` from any `message_id` without exposing internals to the UI.
+
+**Why server-side message_map in SessionState?**
+
+- No agentic internals leaked — UI only sees message_id, never run_id/step_id
+- Survives deploys/restarts — persisted state, not lost on pod recycle
+- Zero SSE envelope changes — no contract change for frontend
+- Single lookup resolves everything — feedback submit/update/delete all just need messageId
+- No crypto overhead — unlike opaque tokens, no key management or rotation
+- Existing infra — orchestrator_state dict already persisted, no new tables/stores needed
+- Doesn't break existing consumers — msg_ format stays unchanged (unlike encoding run_id into the message_id)
+- Feedback_id stored lazily — only messages with actual feedback carry it, no wasted space
+
+## message_id Encoding — Option 2
+
+The `message_id` format encodes the AIP routing coordinates:
+
+```
+msg_[run_id]_[step_id]
+```
+
+**Examples:**
+- `msg_def456-full-uuid_2.done` — step 2 (done) of run `def456-full-uuid`
+- `msg_abc123-uuid_1.tool-use` — step 1 (tool-use) of run `abc123-uuid`
+
+**Parsing logic (backend):**
+
+```python
+def parse_message_id(message_id: str) -> tuple[str, str]:
+    """Extract run_id and step_id from message_id format: msg_[run_id]_[step_id]"""
+    # step_id is always the last segment (e.g., "2.done")
+    # run_id is everything between first "msg_" prefix and the last "_[step_id]"
+    parts = message_id.removeprefix("msg_")
+    # step_id matches pattern: digit(s).word
+    last_underscore = parts.rfind("_")
+    run_id = parts[:last_underscore]
+    step_id = parts[last_underscore + 1:]
+    return run_id, step_id
+```
+
+**Why Option 2:**
+- No server-side lookup required for feedback resolution — `message_id` is self-describing
+- `orchestrator_state["message_map"]` serves as validation cache, not primary lookup
+- Stateless: works even if session state is lost/evicted
+- UI treats `message_id` as an opaque string — no behavior change needed
 
 ---
 
@@ -229,13 +257,12 @@ Only in assistant's `text_content`.
 
 **Data flow:**
 
-1. UI receives SSE event with `run_id` + `step_id`, in the envelope
-2. UI stores `{message_id → {run_id, step_id}}` in component state
-3. User clicks 👍 → UI calls `POST /sessions/{session_id}/{message_id}/capture_feedback` with `{feedbackType: "THUMBS_UP"}`
-4. UI optimistically updates the button state
-5. On error, UI reverts the button state and shows a toast
-6. On successful submission of feedback, there occurs an event stream with `type="feedback"` along with `step_key` and `"data":{"feedback_id":"string","feedbackType":"THUMBS_UP"}}`
-7. UI stores `message_id → feedback_id` separately in order to enable deletion and updation of the feedback state.
+1. UI receives SSE event with `message_id` (encoded as `msg_[run_id]_[step_id]`) — UI treats this as an opaque string
+2. User clicks 👍 → UI calls `POST /sessions/{session_id}/{message_id}/capture_feedback` with `{feedbackType: "THUMBS_UP"}`
+3. UI optimistically updates the button state
+4. On error, UI reverts the button state and shows a toast
+5. On successful submission of feedback, there occurs an event stream with `type="feedback"` along with `step_key` and `"data":{"feedback_id":"string","feedbackType":"THUMBS_UP"}}`
+6. UI stores `message_id → feedback_id` separately in order to enable deletion and updation of the feedback state.
 
 ---
 
@@ -243,7 +270,7 @@ Only in assistant's `text_content`.
 
 **Current state:** Stub endpoint at `/sessions/{session_id}/feedback` returning 202 with no logic.
 
-**Change:** Remove the stub and create 3 dedicated endpoints:
+**Change:** Remove the stub and create 3 dedicated endpoints. The backend resolves `run_id` and `step_id` from the `message_id` by either parsing the encoded format (`msg_[run_id]_[step_id]`) or looking up `SessionState.orchestrator_state["message_map"]`.
 
 #### POST /sessions/{session_id}/{message_id}/capture_feedback
 
@@ -256,19 +283,19 @@ Only in assistant's `text_content`.
 | additionalComments | string | no | Free-form text (max 2000 chars) |
 
 **Flow:**
-1. Resolve `run_id` and `step_id` from the `message_id`
+1. Parse or look up `run_id` and `step_id` from `message_id` via `orchestrator_state["message_map"]`
 2. Map `feedbackType` to AIP rating: `THUMBS_UP → 1.0`, `THUMBS_DOWN → 0.0`
 3. Call AIP: `POST /agent-runs/{run_id}/steps/{step_id}/feedback` with `{rating, comment}`
-4. On success: Emit L1 edit event on SSE stream with `type: "feedback"`, `message_id`, `data: {"feedback_id": "string", "feedbackType": "THUMBS_UP" or "THUMBS_DOWN"}`
+4. On success: Store returned `feedback_id` in `orchestrator_state["message_map"][message_id]["feedback_id"]`. Emit L1 edit event on SSE stream with `type: "feedback"`, `message_id`, `data: {"feedback_id": "string", "feedbackType": "THUMBS_UP" or "THUMBS_DOWN"}`
 5. On failure: Do NOT emit L1 edit. Return error to caller.
 6. Return 201 with `feedback_id` as `id` in response
 
 #### DELETE /sessions/{session_id}/{message_id}/delete_feedback/{feedback_id}
 
 **Flow:**
-1. Resolve `run_id` and `step_id` from the `message_id`
+1. Parse or look up `run_id` and `step_id` from `message_id` via `orchestrator_state["message_map"]`
 2. Call AIP to delete the feedback by `feedback_id`
-3. On success: Emit L1 edit event on SSE stream with `type: "feedback"`, `message_id`, `data: {"feedbackType": "null"}`
+3. On success: Remove `feedback_id` from `orchestrator_state["message_map"][message_id]`. Emit L1 edit event on SSE stream with `type: "feedback"`, `message_id`, `data: {"feedbackType": "null"}`
 4. On failure: Do NOT emit L1 edit. Return error to caller.
 5. Return 200
 
@@ -283,7 +310,7 @@ Only in assistant's `text_content`.
 | additionalComments | string | no | Free-form text (max 2000 chars) |
 
 **Flow:**
-1. Resolve `run_id` and `step_id` from the `message_id`
+1. Parse or look up `run_id` and `step_id` from `message_id` via `orchestrator_state["message_map"]`
 2. Map `feedbackType` to AIP rating: `THUMBS_UP → 1.0`, `THUMBS_DOWN → 0.0`
 3. Call AIP to update the feedback by `feedback_id` with new rating and comment
 4. On success: Emit L1 edit event on SSE stream with `type: "feedback"`, `message_id`, `data: {"feedback_id": "string", "feedbackType": "<updated_type>"}`
@@ -384,10 +411,11 @@ session_id = planning_run_id ("abc-123")
 ### Flow 4: Session reload — feedback state restored
 
 1. User reloads page
-2. UI reconnects SSE stream (messages replay with `run_id` + `step_id` in envelopes)
+2. UI reconnects SSE stream (messages replay with `message_id` in envelopes — `run_id`/`step_id` are NOT exposed)
 3. Backend streams feedback state as L1 edit events:
-   - Fetches messages from both run and stream messages
+   - Fetches messages from both runs and streams messages
    - Fetches feedback from both runs
+   - Resolves `message_id` from `orchestrator_state["message_map"]` or reconstructs from `msg_[run_id]_[step_id]`
    - Adds `type: "feedback"` to payload
    - Transforms: if `rating == 1.0` → `THUMBS_UP`, if `rating == 0.0` → `THUMBS_DOWN`
    - Streams `step_key`, `type = "feedback"`, `data: {"feedback_id": id, "feedbackType": "THUMBS_UP"/"THUMBS_DOWN"}`
@@ -417,9 +445,9 @@ session_id = planning_run_id ("abc-123")
 
 | File | Change |
 |------|--------|
-| `aip_sessions/sse_transform.py` | Under transform_event, check for feedback type and stream feedback events as L1 edit events to UI. Include `aip_step_id` in `format_sse_events` |
-| `aip_sessions/router.py` | Under `GET /sessions/{id}/events`, if payload is a feedback, add `type = "feedback"` and send to `transform_sse`. Implement 3 feedback endpoints (capture_feedback, delete_feedback, change_feedback). Pass `step_id` + `current_run` to `format_sse_frame()` |
-| `orchestrators/aip/client.py` | Add `submit_step_feedback()`, `delete_feedback()`, `update_feedback()`, and `get_run_feedback()` methods |
-| `chat-api-oas.yaml` | Update schema with new endpoints, add `run_id`/`step_id` to SSE envelope |
-| `composer-chat UI` | Feedback buttons on assistant `text_content` messages only, submit/remove/change handlers |
+| `aip_sessions/router.py` | Import `get_session_client`. Add `FeedbackRequest` Pydantic model (`feedbackType`, `feedbackSelections`, `additionalComments`). During SSE streaming, collect `{message_id: {run_id, step_id}}` and flush to `orchestrator_state["message_map"]` after each turn. Replace feedback stub with real endpoints: `capture_feedback` (POST) resolves mapping, calls `client.submit_feedback()`, stores/returns `feedback_id`; `delete_feedback` (DELETE) resolves mapping, calls `client.delete_feedback()`, removes `feedback_id` from state. |
+| `orchestrators/aip/client.py` | Add `submit_feedback(run_id, step_id, rating, comment) → feedback_id` and `delete_feedback(run_id, step_id, feedback_id) → None` methods to `AipAgentClient`. |
+| `aip_sessions/sse_transform.py` | Under `transform_event`, generate `message_id` as `msg_[run_id]_[step_id]`. Check for feedback type and stream feedback events as L1 edit events to UI. |
+| `chat-api-oas.yaml` | Update schema with new endpoints. SSE envelope does NOT include `run_id`/`step_id`. |
+| `composer-chat UI` | Feedback buttons on assistant `text_content` messages only, submit/remove/change handlers. UI treats `message_id` as opaque. |
 | `ai-platform-agents (external)` | Add `step_id` to FeedbackItem response model |
