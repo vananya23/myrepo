@@ -155,7 +155,6 @@ sequenceDiagram
       BE->>AIP: GET /agent-runs/{execution_run_id}/feedback
       AIP-->>BE: [{step_id, rating, id}, ...]
       
-      BE->>BE: Add type=feedback to payload
       BE->>BE: Transform: rating==1.0 → THUMBS_UP, rating==0.0 → THUMBS_DOWN
       Note over BE: SSE stream : step_key,<br/>type=feedback<br/>data={feedback_id,<br/>feedbackType=THUMBS_UP/THUMBS_DOWN}
 ```
@@ -168,7 +167,7 @@ sequenceDiagram
 4. While transforming this to SSE events:
    - If `rating == 1.0` → `feedback = "THUMBS_UP"`
    - If `rating == 0.0` → `feedback = "THUMBS_DOWN"`
-5. Stream `step_key` (integer part of `step_id`), `type = "feedback"`, `data: {"feedback_id": id, "feedbackType": "THUMBS_UP"/"THUMBS_DOWN"}`
+5. Stream `session_id`,`message_id`,`step_key`, `type = "feedback"`, `data: {"feedback_id": id, "feedbackType": "THUMBS_UP"/"THUMBS_DOWN"}`
 6. Return this as UI events
 
 ---
@@ -232,7 +231,7 @@ Only in assistant's `text_content` messages .
 3. UI optimistically updates the button state
 4. On error, UI reverts the button state and shows a toast
 5. On successful submission of feedback, there occurs an event stream with `type="feedback"` along with `step_key` and `"data":{"feedback_id":"string","feedbackType":"THUMBS_UP"}}`
-6. UI stores `message_id → feedback_id` separately in order to enable deletion and updation of the feedback state.
+6. UI stores `message_id → feedback_id` in order to enable deletion and updation of the feedback state.
 
 ---
 
@@ -263,7 +262,7 @@ Only in assistant's `text_content` messages .
 #### DELETE /sessions/{session_id}/{message_id}/delete_feedback/{feedback_id}
 
 **Flow:**
-1. Parse or look up `run_id` and `step_id` from `message_id` via `orchestrator_state["message_map"]`
+1. Parse or look up `run_id` and `step_id` from `message_id`
 2. Call AIP to delete the feedback by `feedback_id`
 3. On success: Remove `feedback_id` from `orchestrator_state["message_map"][message_id]`. Emit L1 edit event on SSE stream with `type: "feedback"`, `message_id`, `data: {"feedbackType": "null"}`
 4. On failure: Do NOT emit L1 edit. Return error to caller.
@@ -280,7 +279,7 @@ Only in assistant's `text_content` messages .
 | additionalComments | string | no | Free-form text (max 2000 chars) |
 
 **Flow:**
-1. Parse or look up `run_id` and `step_id` from `message_id` via `orchestrator_state["message_map"]`
+1. Parse or look up `run_id` and `step_id` from `message_id`
 2. Map `feedbackType` to AIP rating: `THUMBS_UP → 1.0`, `THUMBS_DOWN → 0.0`
 3. Call AIP to update the feedback by `feedback_id` with new rating and comment
 4. On success: Emit L1 edit event on SSE stream with `type: "feedback"`, `message_id`, `data: {"feedback_id": "string", "feedbackType": "<updated_type>"}`
@@ -415,7 +414,7 @@ session_id = planning_run_id ("abc-123")
 
 | File | Change |
 |------|--------|
-| `aip_sessions/router.py` | Import `get_session_client`. Add `FeedbackRequest` Pydantic model (`feedbackType`, `feedbackSelections`, `additionalComments`). During SSE streaming, collect `{message_id: {run_id, step_id}}` and flush to `orchestrator_state["message_map"]` after each turn. Replace feedback stub with real endpoints: `capture_feedback` (POST) resolves mapping, calls `client.submit_feedback()`, stores/returns `feedback_id`; `delete_feedback` (DELETE) resolves mapping, calls `client.delete_feedback()`, removes `feedback_id` from state. |
+| `aip_sessions/router.py` | Import `get_session_client`. Add `FeedbackRequest` Pydantic model (`feedbackType`, `feedbackSelections`, `additionalComments`). Replace feedback stub with real endpoints: `capture_feedback` (POST) resolves mapping, calls `client.submit_feedback()`, stores/returns `feedback_id`; `delete_feedback` (DELETE) resolves mapping, calls `client.delete_feedback()`, removes `feedback_id` from state. |
 | `orchestrators/aip/client.py` | Add `submit_feedback(run_id, step_id, rating, comment) → feedback_id` and `delete_feedback(run_id, step_id, feedback_id) → None` methods to `AipAgentClient`. |
 | `aip_sessions/sse_transform.py` | Under `transform_event`, generate `message_id` as `msg_[run_id]_[step_id]`. Check for feedback type and stream feedback events as L1 edit events to UI. |
 | `chat-api-oas.yaml` | Update schema with new endpoints. SSE envelope does NOT include `run_id`/`step_id`. |
