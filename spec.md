@@ -84,7 +84,6 @@ sequenceDiagram
     BE->>AIP: PUT /agent-runs/{run_id}/steps/{step_id}/feedback/{feedback_id}<br/>{rating,category, comment}
     alt Feedback updated successfully
         AIP-->>BE: 200 OK
-        BE-->>UI 200 OK {"id":"string"}
         Note over BE: SSE L1 edit type=feedback<br/>data={feedback_id, feedbackType=updated}
     else Update failed
         AIP-->>BE: Error
@@ -141,7 +140,7 @@ sequenceDiagram
       participant BE as dev-copilot (Backend)
       participant AIP as AI Platform Agent Service
   
-      UI->>BE: GET /sessions/{session_id}/events
+      UI->>BE: GET /sessions/{session_id}/messages
        
       BE->>AIP: GET /agent-runs/{planning_run_id}/messages
       AIP-->>BE: planning messages
@@ -158,7 +157,7 @@ sequenceDiagram
       
       BE->>BE: Add type=feedback to payload
       BE->>BE: Transform: rating==1.0 → THUMBS_UP, rating==0.0 → THUMBS_DOWN
-      Note over BE: SSE stream step_key,<br/>type=feedback<br/>data={feedback_id,<br/>feedbackType=THUMBS_UP/THUMBS_DOWN}
+      Note over BE: SSE stream : step_key,<br/>type=feedback<br/>data={feedback_id,<br/>feedbackType=THUMBS_UP/THUMBS_DOWN}
 ```
 
 **Stream logic:**
@@ -177,18 +176,7 @@ sequenceDiagram
 ## Detailed Design
 
 **Server-side storage:**
-Store a message_map: {message_id: {run_id, step_id}} in the existing orchestrator_state dict. The UI never sees agentic 
-internals, feedback resolution is a simple dict lookup.
-```python
-# Accumulated during streaming
-message_map[message_id] = {"run_id": run_id, "step_id": step_id}
-```
-
-After each turn completes, the map is flushed to:
-
-```python
-session.orchestrator_state["message_map"] = message_map
-```
+Store a message_map: {message_id: {run_id, step_id}} in the existing orchestrator_state dict. The UI never sees agentic internals, feedback resolution is a simple dict lookup.
 
 This allows the feedback endpoints to resolve `run_id` and `step_id` from any `message_id` without exposing internals to the UI.
 
@@ -215,21 +203,6 @@ msg_[run_id]_[step_id]
 - `msg_def456-full-uuid_2.done` — step 2 (done) of run `def456-full-uuid`
 - `msg_abc123-uuid_1.tool-use` — step 1 (tool-use) of run `abc123-uuid`
 
-**Parsing logic (backend):**
-
-```python
-def parse_message_id(message_id: str) -> tuple[str, str]:
-    """Extract run_id and step_id from message_id format: msg_[run_id]_[step_id]"""
-    # step_id is always the last segment (e.g., "2.done")
-    # run_id is everything between first "msg_" prefix and the last "_[step_id]"
-    parts = message_id.removeprefix("msg_")
-    # step_id matches pattern: digit(s).word
-    last_underscore = parts.rfind("_")
-    run_id = parts[:last_underscore]
-    step_id = parts[last_underscore + 1:]
-    return run_id, step_id
-```
-
 **Why Option 2:**
 - No server-side lookup required for feedback resolution — `message_id` is self-describing
 - `orchestrator_state["message_map"]` serves as validation cache, not primary lookup
@@ -244,7 +217,7 @@ def parse_message_id(message_id: str) -> tuple[str, str]:
 
 **Where feedback buttons appear:**
 
-Only in assistant's `text_content`.
+Only in assistant's `text_content` messages .
 
 **Interaction behavior:**
 
